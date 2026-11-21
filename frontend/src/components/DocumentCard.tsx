@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   FileAudio2,
   FileText,
@@ -47,7 +47,15 @@ export function DocumentCard({ document }: { document: DocumentItem }) {
   const [editing, setEditing] = useState(false);
   const [preview, setPreview] = useState(false);
   const [draft, setDraft] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [versions, setVersions] = useState<Array<{ id: number; version: number; filename: string; created_at: number; text: string }>>([]);
+  const [historyBusy, setHistoryBusy] = useState(false);
   const fileUrl = `/api/files/${document.id}/raw?token=${encodeURIComponent(localStorage.getItem("omnivault-token") || "")}`;
+  const readOnly = user?.role === "reader" || user?.permission === "read_only";
+  useEffect(() => {
+    if (!historyOpen) return;
+    api.versions(document.id).then(setVersions).catch(() => setVersions([]));
+  }, [historyOpen, document.id]);
   const Icon = modalityIcon[(document.modality as keyof typeof modalityIcon) || "text"] || FileText;
   const briefing = document.briefing;
 
@@ -72,9 +80,9 @@ export function DocumentCard({ document }: { document: DocumentItem }) {
               ) : (
                 <span className="chip">{document.chunk_count || 0} {t(lang, "historyVectors")}</span>
               )}
-              {Number(document.meta?.version) > 1 && (
-                <span className="chip">v{String(document.meta.version)}</span>
-              )}
+              <button type="button" className="chip" onClick={() => setHistoryOpen(true)}>
+                v{String(document.meta?.version || 1)}
+              </button>
               <span>·</span>
               <span>{formatBytes(document.size_bytes)}</span>
               <span>·</span>
@@ -311,6 +319,47 @@ export function DocumentCard({ document }: { document: DocumentItem }) {
               {t(lang, "save")}
             </button>
             <button type="button" className="btn-secondary" onClick={() => setEditing(false)}>{t(lang, "close")}</button>
+          </div>
+        </div>
+      )}
+      {historyOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal-card conflict-card">
+            <div className="flex items-start justify-between gap-3">
+              <h2 className="text-xl font-semibold">{t(lang, "versionHistory")}</h2>
+              <button type="button" className="btn-secondary" onClick={() => setHistoryOpen(false)}>{t(lang, "close")}</button>
+            </div>
+            <div className="mt-4 max-h-[60vh] space-y-3 overflow-auto">
+              {versions.length === 0 && <p className="text-sm text-[#6e6e73]">{t(lang, "versionEmpty")}</p>}
+              {versions.map((item) => (
+                <section key={item.id} className="rounded-2xl bg-[#f5f5f7] p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-[13px] font-semibold">v{item.version} · {item.filename}</p>
+                    {!readOnly && (
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        disabled={historyBusy}
+                        onClick={async () => {
+                          setHistoryBusy(true);
+                          try {
+                            const updated = await api.restoreVersion(document.id, item.id);
+                            upsertDocument(updated);
+                            setHistoryOpen(false);
+                            pushToast(lang === "tr" ? `v${item.version} geri yüklendi` : `Restored v${item.version}`, "success");
+                          } finally {
+                            setHistoryBusy(false);
+                          }
+                        }}
+                      >
+                        {t(lang, "versionRestore")}
+                      </button>
+                    )}
+                  </div>
+                  <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap text-[13px] leading-relaxed">{item.text}</pre>
+                </section>
+              ))}
+            </div>
           </div>
         </div>
       )}

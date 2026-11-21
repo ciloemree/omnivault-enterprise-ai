@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import platform
 import re
 import shutil
+import socket
 import threading
 import time
 import uuid
@@ -31,7 +33,7 @@ from backend.core.ollama import OllamaClient
 from backend.core.store import Store
 from backend.core.users import UserStore
 from backend.core.vectorstore import VectorStore
-from backend.ingest.audio import WhisperEngine
+from backend.ingest.audio import WhisperEngine, cloud_transcription_allowed
 from backend import mcp_server
 from backend.ingest.documents import render_pdf_page
 from backend.models.schemas import (
@@ -58,7 +60,7 @@ from backend.core.access import (
     upload_department,
     visible_departments,
 )
-from backend.services.pipeline import AUDIO_TYPES, IMAGE_TYPES, OFFICE_TYPES, PDF_TYPES, TEXT_TYPES, IngestionPipeline
+from backend.services.pipeline import AUDIO_TYPES, IMAGE_TYPES, OFFICE_TYPES, PDF_TYPES, TEXT_TYPES, IngestionPipeline, NameCollision
 from backend.services.suggestions import questions_from_content, suggest_questions
 from backend.services.llm_router import google_api_key, groq_api_key
 from backend.services.rag import RAGService
@@ -134,6 +136,10 @@ async def lifespan(app: FastAPI):
         device=settings.whisper_device,
         compute_type=settings.whisper_compute_type,
         beam_size=settings.whisper_beam_size,
+        mlx_model=settings.mlx_whisper_model,
+        groq_model=settings.groq_whisper_model,
+        settings=settings,
+        store=STATE.store,
     )
     STATE.pipeline = IngestionPipeline(
         settings,
@@ -645,6 +651,8 @@ async def upload_documents(
     files: List[UploadFile] = File(...),
     lang: str = Query(default="en"),
     department: str = Query(default="public"),
+    engine: str = Query(default="local"),
+    resolution: str = Query(default=""),
     x_omnivault_role: Optional[str] = Header(default="admin"),
     x_omnivault_department: Optional[str] = Header(default="public"),
 ) -> List[DocumentOut]:
@@ -678,9 +686,21 @@ async def upload_documents(
                     target.unlink(missing_ok=True)
                     raise HTTPException(413, f"{filename} exceeds {STATE.settings.max_upload_mb} MB limit")
                 handle.write(chunk)
-        document = STATE.pipeline.register_file(
-            target, filename=filename, origin="upload", copy=False, lang=lang, department=stamped, role=role
-        )
+        try:
+            document = STATE.pipeline.register_file(
+                target,
+                filename=filename,
+                origin="upload",
+                copy=False,
+                lang=lang,
+                department=stamped,
+                role=role,
+                engine=engine,
+                resolution=resolution,
+            )
+        except NameCollision as exc:
+            target.unlink(missing_ok=True)
+            raise HTTPException(409, exc.payload) from exc
         created.append(_doc_out(document))
     return created
 
@@ -742,6 +762,55 @@ def read_document_text(doc_id: str) -> Dict[str, str]:
     if not document:
         raise HTTPException(404, "Document not found")
     return {"text": _document_body(document)}
+
+
+@app.get("/api/documents/{doc_id}/versions")
+def document_versions(
+    doc_id: str,
+    x_omnivault_role: Optional[str] = Header(default=None),
+    x_omnivault_department: Optional[str] = Header(default=None),
+) -> List[Dict[str, Any]]:
+    role = _role(x_omnivault_role)
+    document = STATE.store.get_document(doc_id)
+    if not document:
+        raise HTTPException(404, "Document not found")
+    if not can_see_department(role, _department_of(document), _active_department(role, x_omnivault_department)):
+        raise HTTPException(403, "You cannot read that document.")
+    rows = []
+    for item in STATE.store.list_document_versions(doc_id):
+        rows.append(
+            {
+                "id": item["id"],
+                "version": item["version"],
+                "filename": item["filename"],
+                "created_at": item["created_at"],
+                "text": str(item.get("body") or "")[:8000],
+            }
+        )
+    return rows
+
+
+@app.post("/api/documents/{doc_id}/versions/{snapshot_id}/restore", response_model=DocumentOut)
+def restore_document_version(
+    doc_id: str,
+    snapshot_id: int,
+    x_omnivault_role: Optional[str] = Header(default=None),
+    x_omnivault_department: Optional[str] = Header(default=None),
+) -> DocumentOut:
+    role = _role(x_omnivault_role)
+    _require_write(role)
+    document = STATE.store.get_document(doc_id)
+    if not document:
+        raise HTTPException(404, "Document not found")
+    if not can_mutate_document(role, _department_of(document), _active_department(role, x_omnivault_department)):
+        raise HTTPException(403, "You cannot update this document.")
+    snapshot = STATE.store.get_document_version(doc_id, snapshot_id)
+    if not snapshot or not str(snapshot.get("body") or "").strip():
+        raise HTTPException(404, "That version is no longer stored.")
+    updated = STATE.pipeline.replace_text(doc_id, str(snapshot["body"]))
+    if not updated:
+        raise HTTPException(400, "That version could not be restored.")
+    return _doc_out(updated)
 
 
 @app.put("/api/documents/{doc_id}/text", response_model=DocumentOut)
@@ -1343,6 +1412,7 @@ class NoteIn(BaseModel):
 @app.post("/api/notes", response_model=DocumentOut)
 def create_note(
     body: NoteIn,
+    resolution: str = Query(default=""),
     x_omnivault_role: Optional[str] = Header(default="admin"),
     x_omnivault_department: Optional[str] = Header(default="public"),
 ) -> DocumentOut:
@@ -1361,15 +1431,20 @@ def create_note(
     safe = "".join(ch if ch.isalnum() or ch in "-_ " else "-" for ch in title).strip().replace(" ", "-") or "note"
     path = staging / f"{int(time.time() * 1000)}_{safe[:80]}.md"
     path.write_text(f"# {title}\n\nDepartment: {department}\n\n{text}\n", encoding="utf-8")
-    document = STATE.pipeline.register_file(
-        path,
-        filename=f"{title[:120]}.md",
-        origin="note",
-        copy=False,
-        lang=body.lang,
-        department=department,
-        role=role,
-    )
+    try:
+        document = STATE.pipeline.register_file(
+            path,
+            filename=f"{title[:120]}.md",
+            origin="note",
+            copy=False,
+            lang=body.lang,
+            department=department,
+            role=role,
+            resolution=resolution,
+        )
+    except NameCollision as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(409, exc.payload) from exc
     return _doc_out(document)
 
 
@@ -1489,6 +1564,95 @@ def delete_department(slug: str) -> List[Dict[str, Any]]:
     return _department_rows()
 
 
+_EMPTY_MD_LINK = re.compile(r"\[(?:\s|\*)*\]\([^)]*\)")
+_MAX_PAGE_BYTES = 5 * 1024 * 1024
+
+
+class _UrlRejected(Exception):
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+def _blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return bool(
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _reject_private_host(hostname: str) -> None:
+    host = (hostname or "").strip().strip("[]").rstrip(".").lower()
+    if not host or host == "localhost" or host.endswith(".localhost") or host == "metadata.google.internal":
+        raise _UrlRejected(400, "That address is not allowed.")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise _UrlRejected(400, "That address could not be resolved.") from exc
+    addresses = []
+    for info in infos:
+        try:
+            addresses.append(ipaddress.ip_address(info[4][0]))
+        except ValueError:
+            continue
+    if not addresses or any(_blocked_ip(ip) for ip in addresses):
+        raise _UrlRejected(400, "That address is not allowed.")
+
+
+def _fetch_public(url: str, headers: Dict[str, str]) -> str:
+    """GET a public page with a 15s timeout and a 5 MB cap. Redirects are checked too."""
+    import httpx
+
+    def guard(request: httpx.Request) -> None:
+        _reject_private_host(request.url.host)
+
+    timeout = httpx.Timeout(15.0)
+    with httpx.Client(timeout=timeout, follow_redirects=True, verify=False, event_hooks={"request": [guard]}) as client:
+        with client.stream("GET", url, headers=headers) as response:
+            response.raise_for_status()
+            announced = response.headers.get("content-length")
+            if announced and announced.isdigit() and int(announced) > _MAX_PAGE_BYTES:
+                raise _UrlRejected(413, "That page is larger than 5 MB.")
+            chunks = []
+            total = 0
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > _MAX_PAGE_BYTES:
+                    raise _UrlRejected(413, "That page is larger than 5 MB.")
+                chunks.append(chunk)
+            encoding = response.encoding or "utf-8"
+            return b"".join(chunks).decode(encoding, errors="replace")
+
+
+def _tidy_markdown(text: str) -> str:
+    """Drop empty links and broken emphasis left by the page extractor."""
+    cleaned = []
+    for raw in _EMPTY_MD_LINK.sub("", text).splitlines():
+        line = raw.strip()
+        if re.fullmatch(r"\*{1,}", line):
+            cleaned.append("")
+            continue
+        wrapped = re.fullmatch(r"\*{3,}\s*(.*?)\s*\*{3,}", line)
+        if wrapped:
+            line = wrapped.group(1).strip()
+        if line.startswith("#"):
+            mark = re.match(r"#{1,6}", line)
+            body = line[mark.end():].strip().strip("*").strip() if mark else line
+            line = f"{mark.group(0)} {body}".rstrip() if mark and body else ""
+        elif line.count("***") % 2 == 1:
+            line = line.replace("***", "").strip()
+        cleaned.append(line)
+    collapsed = re.sub(r"\n{4,}", "\n\n\n", "\n".join(cleaned))
+    return collapsed.strip()
+
+
 def _polish_page(text: str) -> str:
     lines = text.splitlines()
     for index, line in enumerate(lines):
@@ -1511,10 +1675,8 @@ def _polish_page(text: str) -> str:
         line = re.sub(r"\[değiştir \| kaynağı değiştir\]", "", line, flags=re.IGNORECASE)
         line = re.sub(r"\[[^\]]*\]\(javascript:.*\)", "", line)
         line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line)
-        line = line.strip()
-        if line:
-            cleaned.append(line)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
+        cleaned.append(line.strip())
+    return _tidy_markdown("\n".join(cleaned))
 
 
 class UrlIn(BaseModel):
@@ -1533,7 +1695,6 @@ def ingest_url(
     role = _role(x_omnivault_role)
     _require_write(role)
     from urllib.parse import urlparse
-    import httpx
     from bs4 import BeautifulSoup
 
     def _clean_article(html: str) -> tuple[str, str]:
@@ -1565,6 +1726,8 @@ def ingest_url(
         parsed = urlparse(body.url.strip())
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise HTTPException(400, "Enter an http or https address.")
+        target = body.url.strip()
+        _reject_private_host(parsed.hostname or "")
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml",
@@ -1572,22 +1735,19 @@ def ingest_url(
         text = ""
         title = parsed.netloc
         try:
-            response = httpx.get(body.url.strip(), headers=headers, follow_redirects=True, timeout=15.0, verify=False)
-            response.raise_for_status()
-            title, text = _clean_article(response.text)
+            raw = _fetch_public(target, headers)
+            title, text = _clean_article(raw)
             title = title or parsed.netloc
+        except _UrlRejected:
+            raise
         except Exception:
             text = ""
         if len(text.strip()) < 40:
-            mirror = httpx.get(
-                f"https://r.jina.ai/{body.url.strip()}",
-                headers={"User-Agent": headers["User-Agent"]},
-                follow_redirects=True,
-                timeout=30.0,
-                verify=False,
+            mirror = _fetch_public(
+                f"https://r.jina.ai/{target}",
+                {"User-Agent": headers["User-Agent"]},
             )
-            mirror.raise_for_status()
-            text = mirror.text.strip()
+            text = mirror.strip()
             first = next((line[2:].strip() for line in text.splitlines() if line.startswith("# ")), "")
             if first:
                 title = first[:180]
@@ -1596,6 +1756,8 @@ def ingest_url(
             raise HTTPException(422, "That page did not contain enough readable text.")
     except HTTPException:
         raise
+    except _UrlRejected as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
     except Exception as exc:
         raise HTTPException(422, f"Could not read that page: {exc}") from exc
     if body.preview:
@@ -1605,15 +1767,19 @@ def ingest_url(
     staging.mkdir(parents=True, exist_ok=True)
     path = staging / f"{int(time.time() * 1000)}_page.md"
     path.write_text(f"# {title}\n\nSource: {body.url.strip()}\n\n{text}\n", encoding="utf-8")
-    document = STATE.pipeline.register_file(
-        path,
-        filename=f"{title[:80]}.md",
-        origin="url",
-        copy=False,
-        lang=body.lang,
-        department=department,
-        role=role,
-    )
+    try:
+        document = STATE.pipeline.register_file(
+            path,
+            filename=f"{title[:80]}.md",
+            origin="url",
+            copy=False,
+            lang=body.lang,
+            department=department,
+            role=role,
+        )
+    except NameCollision as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(409, exc.payload) from exc
     return _doc_out(document)
 
 
@@ -1621,6 +1787,7 @@ def ingest_url(
 async def transcribe_question(
     file: UploadFile = File(...),
     lang: str = Query(default="tr"),
+    engine: str = Query(default="local"),
     x_omnivault_role: Optional[str] = Header(default="admin"),
 ) -> Dict[str, Any]:
     _role(x_omnivault_role)
@@ -1639,6 +1806,7 @@ async def transcribe_question(
             filename=target.name,
             transcript_dir=STATE.settings.transcripts_dir,
             language="en" if str(lang).lower().startswith("en") else "tr",
+            allow_cloud=cloud_transcription_allowed(engine),
         )
     except Exception as exc:
         logger.exception("Question transcription failed")

@@ -16,6 +16,22 @@ function roleHeader(): Record<string, string> {
   return headers;
 }
 
+export interface ConflictPayload {
+  conflict_detected: true;
+  namesake: boolean;
+  existing: { id: string; filename: string; version: number; fields: Record<string, string>; text: string };
+  incoming: { filename: string; fields: Record<string, string>; text: string };
+}
+
+export class ConflictError extends Error {
+  payload: ConflictPayload;
+  constructor(payload: ConflictPayload) {
+    super("conflict_detected");
+    this.name = "ConflictError";
+    this.payload = payload;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const role = roleHeader();
@@ -23,6 +39,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, headers });
   if (response.status === 401 && !path.startsWith("/api/auth/login")) {
     localStorage.removeItem("omnivault-token");
+  }
+  if (response.status === 409) {
+    const body = await response.json().catch(() => null);
+    const detail = body && typeof body === "object" ? (body as { detail?: ConflictPayload }).detail : undefined;
+    if (detail?.conflict_detected) throw new ConflictError(detail);
   }
   if (!response.ok) {
     let detail = response.statusText;
@@ -187,24 +208,39 @@ export const api = {
       body: JSON.stringify(body),
     }),
   documents: () => request<DocumentItem[]>("/api/documents"),
-  upload: async (files: FileList | File[], lang: "en" | "tr" = "en", department = "public") => {
+  upload: async (
+    files: FileList | File[],
+    lang: "en" | "tr" = "en",
+    department = "public",
+    engine = "local",
+    resolution = "",
+  ) => {
     const form = new FormData();
     Array.from(files).forEach((file) => form.append("files", file));
-    return request<DocumentItem[]>(`/api/documents/upload?lang=${lang}&department=${department}`, {
-      method: "POST",
-      body: form,
-    });
+    const mode = encodeURIComponent(engine || "local");
+    const choice = encodeURIComponent(resolution || "");
+    return request<DocumentItem[]>(
+      `/api/documents/upload?lang=${lang}&department=${department}&engine=${mode}&resolution=${choice}`,
+      { method: "POST", body: form },
+    );
   },
-  note: (body: { title: string; body: string; department: string; lang: "en" | "tr" }) =>
-    request<DocumentItem>("/api/notes", {
+  note: (body: { title: string; body: string; department: string; lang: "en" | "tr" }, resolution = "") =>
+    request<DocumentItem>(`/api/notes?resolution=${encodeURIComponent(resolution || "")}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
-  transcribe: async (blob: Blob, filename: string, lang: "en" | "tr" = "tr") => {
+  versions: (id: string) =>
+    request<Array<{ id: number; version: number; filename: string; created_at: number; text: string }>>(
+      `/api/documents/${id}/versions`,
+    ),
+  restoreVersion: (id: string, snapshotId: number) =>
+    request<DocumentItem>(`/api/documents/${id}/versions/${snapshotId}/restore`, { method: "POST" }),
+  transcribe: async (blob: Blob, filename: string, lang: "en" | "tr" = "tr", engine = "local") => {
     const form = new FormData();
     form.append("file", blob, filename);
-    return request<{ text: string; language: string }>(`/api/transcribe?lang=${lang}`, { method: "POST", body: form });
+    const mode = encodeURIComponent(engine || "local");
+    return request<{ text: string; language: string }>(`/api/transcribe?lang=${lang}&engine=${mode}`, { method: "POST", body: form });
   },
   suggestions: (lang: "en" | "tr") => request<{ questions: string[]; persona: string }>(`/api/suggestions?lang=${lang}`),
   previewUrl: (url: string) =>

@@ -66,6 +66,16 @@ CREATE TABLE IF NOT EXISTS departments (
     name TEXT NOT NULL,
     sort_order INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS document_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_document_versions_doc ON document_versions(doc_id, id);
 """
 
 JSON_FIELDS = ("meta", "briefing", "privacy")
@@ -337,6 +347,32 @@ class Store:
             "department": row["department"],
             "detail": detail,
         }
+
+    def save_document_version(self, *, doc_id: str, version: int, filename: str, body: str) -> None:
+        text = (body or "").strip()
+        if not text:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO document_versions (doc_id, version, filename, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                (doc_id, int(version), filename, text[:200000], time.time()),
+            )
+
+    def list_document_versions(self, doc_id: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, doc_id, version, filename, body, created_at FROM document_versions WHERE doc_id = ? ORDER BY id DESC",
+                (doc_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_document_version(self, doc_id: str, snapshot_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, doc_id, version, filename, body, created_at FROM document_versions WHERE doc_id = ? AND id = ?",
+                (doc_id, snapshot_id),
+            ).fetchone()
+        return dict(row) if row else None
 
     def list_revisions(self, limit: int = 50) -> List[Dict[str, Any]]:
         with self._lock:

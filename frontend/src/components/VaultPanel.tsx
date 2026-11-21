@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useOmni } from "../lib/store";
-import { api } from "../lib/api";
+import { api, ConflictError, type ConflictPayload } from "../lib/api";
 import { roomLabel, t } from "../lib/i18n";
 import { DocumentCard } from "./DocumentCard";
 
@@ -11,6 +11,7 @@ export function VaultPanel() {
   const upload = useOmni((s) => s.upload);
   const saveNote = useOmni((s) => s.saveNote);
   const lang = useOmni((s) => s.lang);
+  const engine = useOmni((s) => s.engine);
   const role = useOmni((s) => s.role);
   const user = useOmni((s) => s.user);
   const readOnly = user?.role !== "admin" && user?.permission === "read_only";
@@ -31,6 +32,8 @@ export function VaultPanel() {
   const [linkTitle, setLinkTitle] = useState("");
   const [linkBusy, setLinkBusy] = useState(false);
   const [linkError, setLinkError] = useState("");
+  const [conflict, setConflict] = useState<ConflictPayload | null>(null);
+  const pendingSave = useRef<{ kind: "files"; files: File[]; department: string } | { kind: "note"; note: { title: string; body: string; department: string } } | null>(null);
 
   useEffect(() => {
     if (role !== "admin") return;
@@ -49,16 +52,62 @@ export function VaultPanel() {
     return documents.filter((doc) => doc.modality === filter);
   }, [documents, filter]);
 
+  function rememberConflict(error: unknown, pending: NonNullable<typeof pendingSave.current>) {
+    if (error instanceof ConflictError) {
+      pendingSave.current = pending;
+      setConflict(error.payload);
+      return true;
+    }
+    return false;
+  }
+
+  async function resolveConflict(choice: "update" | "separate" | "cancel") {
+    const pending = pendingSave.current;
+    const current = conflict;
+    setConflict(null);
+    pendingSave.current = null;
+    if (choice === "cancel" || !pending || !current) return;
+    if (pending.kind === "files") {
+      const file = pending.files.find((item) => item.name === current.incoming.filename) || pending.files[0];
+      const rest = pending.files.filter((item) => item !== file);
+      try {
+        await upload([file], pending.department, choice);
+      } catch (error) {
+        if (rememberConflict(error, { kind: "files", files: [file, ...rest], department: pending.department })) return;
+        throw error;
+      }
+      if (rest.length) {
+        try {
+          await upload(rest, pending.department);
+        } catch (error) {
+          if (!rememberConflict(error, { kind: "files", files: rest, department: pending.department })) throw error;
+        }
+      }
+      return;
+    }
+    try {
+      await saveNote(pending.note, choice);
+    } catch (error) {
+      if (!rememberConflict(error, pending)) throw error;
+    }
+  }
+
   async function onFiles(fileList: FileList | null) {
     if (!fileList?.length) return;
     const files = Array.from(fileList);
     const audio = files.filter((file) => /\.(mp3|wav|m4a|webm|ogg)$/i.test(file.name));
     const rest = files.filter((file) => !audio.includes(file));
-    if (rest.length) await upload(rest, lockedDepartment);
+    if (rest.length) {
+      try {
+        await upload(rest, lockedDepartment);
+      } catch (error) {
+        if (!rememberConflict(error, { kind: "files", files: rest, department: lockedDepartment })) throw error;
+      }
+    }
     if (!audio[0]) return;
     setVoiceBusy(true);
     try {
-      const result = await api.transcribe(audio[0], audio[0].name, lang);
+      const result = await api.transcribe(audio[0], audio[0].name, lang, engine);
       setVoiceText(result.text || "");
       setAudioName(audio[0].name.replace(/\.[^.]+$/, ""));
     } finally {
@@ -69,7 +118,12 @@ export function VaultPanel() {
   async function onNote(event: FormEvent) {
     event.preventDefault();
     if (!title.trim() || !body.trim()) return;
-    await saveNote({ title: title.trim(), body: body.trim(), department: lockedDepartment });
+    try {
+      await saveNote({ title: title.trim(), body: body.trim(), department: lockedDepartment });
+    } catch (error) {
+      if (!rememberConflict(error, { kind: "note", note: { title: title.trim(), body: body.trim(), department: lockedDepartment } })) throw error;
+      return;
+    }
     setTitle("");
     setBody("");
   }
@@ -140,7 +194,12 @@ export function VaultPanel() {
                   className="btn-primary"
                   disabled={!voiceText.trim()}
                   onClick={async () => {
-                    await saveNote({ title: audioName, body: voiceText.trim(), department: lockedDepartment });
+                    try {
+                      await saveNote({ title: audioName, body: voiceText.trim(), department: lockedDepartment });
+                    } catch (error) {
+                      if (!rememberConflict(error, { kind: "note", note: { title: audioName, body: voiceText.trim(), department: lockedDepartment } })) throw error;
+                      return;
+                    }
                     setVoiceText("");
                     setAudioName("");
                   }}
@@ -166,7 +225,7 @@ export function VaultPanel() {
               onBlob={async (blob) => {
                 setVoiceBusy(true);
                 try {
-                  const result = await api.transcribe(blob, "voice-note.webm", lang);
+                  const result = await api.transcribe(blob, "voice-note.webm", lang, engine);
                   setVoiceText(result.text || "");
                 } finally {
                   setVoiceBusy(false);
@@ -181,7 +240,13 @@ export function VaultPanel() {
               className="btn-primary"
               disabled={!voiceText.trim()}
               onClick={async () => {
-                await saveNote({ title: voiceText.trim().slice(0, 48), body: voiceText.trim(), department: lockedDepartment });
+                const spokenTitle = voiceText.trim().slice(0, 48);
+                try {
+                  await saveNote({ title: spokenTitle, body: voiceText.trim(), department: lockedDepartment });
+                } catch (error) {
+                  if (!rememberConflict(error, { kind: "note", note: { title: spokenTitle, body: voiceText.trim(), department: lockedDepartment } })) throw error;
+                  return;
+                }
                 setVoiceText("");
               }}
             >
@@ -232,7 +297,7 @@ export function VaultPanel() {
               onChange={(event) => setPageUrl(event.target.value)}
             />
             <button type="submit" className="btn-primary" disabled={!pageUrl.trim() || linkBusy}>
-              {linkBusy ? t(lang, "asking") : t(lang, "urlSave")}
+              {linkBusy ? t(lang, "urlBusy") : t(lang, "urlSave")}
             </button>
           </form>
           {linkError && <p className="mt-2 text-sm text-[#b42318]">{linkError}</p>}
@@ -243,9 +308,15 @@ export function VaultPanel() {
               <button
                 type="button"
                 className="btn-primary"
-                disabled={!linkDraft.trim()}
+                disabled={!linkDraft.trim() || linkBusy}
                 onClick={async () => {
-                  await saveNote({ title: linkTitle || pageUrl, body: linkDraft.trim(), department: lockedDepartment });
+                  const pageTitle = linkTitle || pageUrl;
+                  try {
+                    await saveNote({ title: pageTitle, body: linkDraft.trim(), department: lockedDepartment });
+                  } catch (error) {
+                    if (!rememberConflict(error, { kind: "note", note: { title: pageTitle, body: linkDraft.trim(), department: lockedDepartment } })) throw error;
+                    return;
+                  }
                   setLinkDraft("");
                   setPageUrl("");
                 }}
@@ -285,7 +356,51 @@ export function VaultPanel() {
           ))}
         </div>
       )}
+      {conflict && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true">
+          <div className="modal-card conflict-card">
+            <h2 className="text-xl font-semibold">{t(lang, "conflictTitle")}</h2>
+            {conflict.namesake && <p className="mt-3 inline-flex rounded-full bg-[#fff4e5] px-3 py-1 text-[13px] font-semibold text-[#9a6700]">{t(lang, "conflictNamesake")}</p>}
+            <div className="mt-4 grid gap-3 md:grid-cols-2">
+              <ConflictColumn title={t(lang, "conflictCurrent")} filename={conflict.existing.filename} version={conflict.existing.version} fields={conflict.existing.fields} text={conflict.existing.text} />
+              <ConflictColumn title={t(lang, "conflictIncoming")} filename={conflict.incoming.filename} fields={conflict.incoming.fields} text={conflict.incoming.text} />
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button type="button" className="btn-secondary" onClick={() => void resolveConflict("cancel")}>{t(lang, "cancel")}</button>
+              <button type="button" className="btn-secondary" onClick={() => void resolveConflict("separate")}>{t(lang, "conflictSeparate")}</button>
+              <button type="button" className="btn-primary" onClick={() => void resolveConflict("update")}>{t(lang, "conflictUpdate")}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+function ConflictColumn({
+  title,
+  filename,
+  version,
+  fields,
+  text,
+}: {
+  title: string;
+  filename: string;
+  version?: number;
+  fields: Record<string, string>;
+  text: string;
+}) {
+  const bits = [fields.age && `${fields.age} yaş`, fields.role, fields.amount].filter(Boolean);
+  return (
+    <section className="rounded-2xl bg-[#f5f5f7] p-3">
+      <div className="text-[13px] font-semibold">{title}</div>
+      <p className="mt-1 text-[13px] text-[#6e6e73]">
+        {filename}
+        {version ? ` · v${version}` : ""}
+        {bits.length ? ` · ${bits.join(" · ")}` : ""}
+      </p>
+      <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap text-[13px] leading-relaxed">{text || "—"}</pre>
+    </section>
   );
 }
 

@@ -266,6 +266,10 @@ def _open_vault() -> Dict[str, Any]:
         device=settings.whisper_device,
         compute_type=settings.whisper_compute_type,
         beam_size=settings.whisper_beam_size,
+        mlx_model=settings.mlx_whisper_model,
+        groq_model=settings.groq_whisper_model,
+        settings=settings,
+        store=store,
     )
     pipeline = IngestionPipeline(settings, store, vectors, ollama, whisper, EventBus())
     _VAULT = {"store": store, "vectors": vectors, "pipeline": pipeline}

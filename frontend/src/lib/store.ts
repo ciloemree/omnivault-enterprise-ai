@@ -60,8 +60,8 @@ interface OmniState {
   register: (body: { username: string; password: string; full_name: string; department: string }) => Promise<void>;
   logout: () => Promise<void>;
   clearHistory: () => Promise<void>;
-  upload: (files: FileList | File[], department?: string) => Promise<void>;
-  saveNote: (note: { title: string; body: string; department: string }) => Promise<void>;
+  upload: (files: FileList | File[], department?: string, resolution?: "update" | "separate" | "") => Promise<void>;
+  saveNote: (note: { title: string; body: string; department: string }, resolution?: "update" | "separate" | "") => Promise<void>;
   transferDocument: (id: string, target: string, mode: "move" | "copy") => Promise<void>;
   confirmPendingUpdate: (index: number) => Promise<void>;
   cancelPendingUpdate: (index: number) => void;
@@ -236,16 +236,16 @@ export const useOmni = create<OmniState>((set, get) => ({
     new Promise((resolve) => {
       set({ confirm: { resolve } });
     }),
-  upload: async (files, department) => {
+  upload: async (files, department, resolution) => {
     const active = get().department;
     const stamp = department && department !== "all" ? department : active !== "all" ? active : "public";
-    const saved = await api.upload(files, get().lang, stamp);
+    const saved = await api.upload(files, get().lang, stamp, get().engine, resolution || "");
     await get().refreshDocuments();
     set({ activeTab: "vault" });
     get().pushToast(versionMessage(saved, get().lang) || (get().lang === "tr" ? "Dosya yüklendi" : "File uploaded"), "success");
   },
-  saveNote: async (note) => {
-    const saved = await api.note({ ...note, lang: get().lang });
+  saveNote: async (note, resolution) => {
+    const saved = await api.note({ ...note, lang: get().lang }, resolution || "");
     await get().refreshDocuments();
     get().pushToast(versionMessage([saved], get().lang) || (get().lang === "tr" ? "Dosya eklendi" : "File added"), "success");
   },

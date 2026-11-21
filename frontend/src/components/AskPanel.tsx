@@ -175,7 +175,7 @@ export function AskPanel() {
     media.onstop = async () => {
       stream.getTracks().forEach((track) => track.stop());
       const blob = new Blob(parts, { type: media.mimeType || "audio/webm" });
-      const result = await api.transcribe(blob, "question.webm", lang);
+      const result = await api.transcribe(blob, "question.webm", lang, engine);
       if (result.text) {
         setQuestion(result.text);
         if (box.current) resize(box.current);

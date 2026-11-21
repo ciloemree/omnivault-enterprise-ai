@@ -76,7 +76,9 @@ class Settings(BaseSettings):
     whisper_model: str = "base"
     whisper_compute_type: str = "int8"
     whisper_device: str = "cpu"
-    whisper_beam_size: int = 5
+    whisper_beam_size: int = 1
+    mlx_whisper_model: str = "mlx-community/whisper-large-v3-turbo"
+    groq_whisper_model: str = "whisper-large-v3-turbo"
 
     chunk_size: int = 1100
     chunk_overlap: int = 160

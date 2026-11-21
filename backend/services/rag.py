@@ -75,8 +75,9 @@ def system_prompt(language: str, department: str) -> str:
             "temiz bir Markdown tablosu (| ... | ... |) formatında sun. Sütunları verinin kendisine göre seç. "
             "İlk belgeyle yetinme; ilgili her kaydı ayrı satır yaz. Dosya başlığını ve Department satırını kopyalama. "
             "Kaynak numarasını hücrenin içine koyma.\n"
-            "Aynı kişi veya konu için belgelerde farklı rakam varsa en güncel tarihli belgeyi esas al. "
-            "Önce yeni değeri yaz, sonra eski değeri ve tarihini kısaca belirt."
+            "Aynı ada sahip birden fazla farklı belge varsa yalnızca birini seçme. "
+            "Her kaydı yaşı, görevi, departmanı, dosya adı ve tarihiyle ayrı ayrı yaz. "
+            "Aynı belgenin kendi sürümleri çelişirse en güncel tarihi esas al."
         )
     return (
         f"{persona}\n"
@@ -93,8 +94,9 @@ def system_prompt(language: str, department: str) -> str:
         "or the user asked for a table or a list, present the real facts from the sources as a clean Markdown table (| ... | ... |). "
         "Choose the columns from the data. Do not stop after the first document; give each record its own row. "
         "Do not copy a file title or a Department line. Do not put source numbers inside cells.\n"
-        "If two documents disagree about the same person or topic, the newest timestamp is the active fact. "
-        "State the newest value first, then note the older value and its date."
+        "If several distinct documents match the same person or entity name, never choose only one. "
+        "List every matching record with its age, role, department, document name, and date. "
+        "If versions of the same document disagree, use the newest date."
     )
 
 def _document_time(document: Optional[Dict[str, Any]]) -> float:
@@ -761,14 +763,16 @@ class RAGService:
                 f"{memory}Soru: {safe_question}\n\n"
                 "Kaynaklardaki her kişiyi ayrı yaz. Maaş, yaş ve görev bir belgede varsa hepsini yaz; bir kişide eksik olan bilgiyi diğer kişiden silme. "
                 "Yanıt birden fazla kişi, personel, maaş, gider kalemi, tarih veya karşılaştırma içeriyorsa ya da tablo veya liste istendiyse, "
-                "kaynaklardaki gerçek verilerle temiz bir Markdown tablosu (| ... | ... |) yaz. Çelişen rakamda en güncel tarih geçerlidir; eski değeri ve tarihini de yaz.\n\n"
+                "kaynaklardaki gerçek verilerle temiz bir Markdown tablosu (| ... | ... |) yaz. "
+                "Aynı ada birden fazla belge denk gelirse hepsini ayırt edici bilgileriyle listele; birini sessizce seçme.\n\n"
                 + "\n\n".join(context_blocks)
             )
         else:
             user_prompt = (
                 f"{memory}Question: {safe_question}\n\n"
                 "If the answer has several people, salaries, expense items, dates, or a comparison, or a table or list was requested, "
-                "write a clean Markdown table (| ... | ... |) from the real source facts. If figures conflict, the newer date wins; mention the older figure and its date.\n\n"
+                "write a clean Markdown table (| ... | ... |) from the real source facts. "
+                "If several documents share a name, list each record with its distinguishing details instead of picking one.\n\n"
                 + "\n\n".join(context_blocks)
             )
 
@@ -781,7 +785,7 @@ class RAGService:
                 "Bir kişide maaş yoksa yalnızca o kişi için söyle. "
                 "Yanıt birden fazla kişi, personel, maaş, gider kalemi, tarih veya karşılaştırmalı veri içeriyorsa "
                 "ya da kullanıcı tablo veya liste istediyse, kaynaklardaki gerçek verilerle temiz bir Markdown tablosu (| ... | ... |) yaz. "
-                "Sütunları veriye göre seç. İki belgede rakam çelişirse en güncel tarihli değeri yaz, eski değeri ve tarihini de belirt. Yönerge cümlesi yazma."
+                "Sütunları veriye göre seç. Aynı ada birden fazla belge varsa her birini yaşı, görevi, departmanı, dosya adı ve tarihiyle ayrı yaz. Yönerge cümlesi yazma."
             )
         messages = [
             {"role": "system", "content": prompt},

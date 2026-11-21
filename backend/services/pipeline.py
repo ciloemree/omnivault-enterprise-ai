@@ -18,7 +18,7 @@ from backend.core.events import EventBus
 from backend.core.ollama import OllamaClient
 from backend.core.store import Store
 from backend.core.vectorstore import VectorStore
-from backend.ingest.audio import WhisperEngine
+from backend.ingest.audio import WhisperEngine, cloud_transcription_allowed
 from backend.ingest.documents import extract_document
 from backend.ingest.images import extract_image
 from backend.core.chunking import chunk_text
@@ -63,6 +63,94 @@ def person_key(text: str) -> Optional[str]:
     if not match:
         return None
     return f"{_fold_name(match.group(1))}|{_fold_name(match.group(2))}"
+
+
+class NameCollision(Exception):
+    """An active document in the same department already uses this name or filename."""
+
+    def __init__(self, payload: Dict[str, Any]) -> None:
+        super().__init__("conflict_detected")
+        self.payload = payload
+
+
+_AGE = re.compile(r"(?:ya[sş]\s*[:\-]?\s*(\d{1,3})|(\d{1,3})\s*ya[sş])", re.IGNORECASE)
+_ROLE = re.compile(r"(?:görev|unvan|pozisyon|rol(?:ü|u)?|title)\s*[:\-]\s*(.+)", re.IGNORECASE)
+_EMAIL = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+_IDENT = re.compile(r"(?:tckn|tc\s*kimlik|kimlik\s*no|sicil(?:\s*no)?)\s*[:\-]\s*(\d{5,11})", re.IGNORECASE)
+_MONEY = re.compile(r"(\d+(?:[.\s]\d{3})*|\d+)\s*(bin)?\s*tl\b", re.IGNORECASE)
+_DEPT_LINE = re.compile(r"(?:department|departman)\s*[:\-]\s*([^\n]+)", re.IGNORECASE)
+_HEADING_NAME = re.compile(r"^#\s+([^\n#]{3,80})$", re.MULTILINE)
+
+
+def _fold_phrase(value: str) -> str:
+    return " ".join(_fold_name(part) for part in re.split(r"\s+", (value or "").strip()) if part)
+
+
+def _names_in_text(text: str, filename: str = "") -> set[str]:
+    found: set[str] = set()
+    match = _PERSON.search(text or "")
+    if match:
+        found.add(_fold_phrase(f"{match.group(1)} {match.group(2)}"))
+    heading = _HEADING_NAME.search(text or "")
+    if heading:
+        title = heading.group(1).strip()
+        if 2 <= len(title.split()) <= 4:
+            found.add(_fold_phrase(title))
+    stem = Path(filename).stem.replace("-", " ").replace("_", " ")
+    folded = _fold_phrase(stem)
+    if len(folded.split()) >= 2:
+        found.add(folded)
+    return {item for item in found if item}
+
+
+def _first_age(text: str) -> Optional[int]:
+    match = _AGE.search(text or "")
+    if not match:
+        return None
+    try:
+        value = int(match.group(1) or match.group(2))
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value < 120 else None
+
+
+def _record_fields(text: str) -> Dict[str, str]:
+    role = _ROLE.search(text or "")
+    email = _EMAIL.search(text or "")
+    ident = _IDENT.search(text or "")
+    money = _MONEY.search(text or "")
+    department = _DEPT_LINE.search(text or "")
+    age = _first_age(text or "")
+    amount = ""
+    if money:
+        number = money.group(1).replace(" ", "")
+        amount = f"{number}{' bin' if money.group(2) else ''} TL"
+    return {
+        "age": str(age) if age else "",
+        "role": (role.group(1).strip() if role else "")[:80],
+        "amount": amount,
+        "email": email.group(0) if email else "",
+        "ident": ident.group(1) if ident else "",
+        "department": department.group(1).strip()[:80] if department else "",
+    }
+
+
+def _namesake(left: Dict[str, str], right: Dict[str, str]) -> bool:
+    if left.get("age") and right.get("age"):
+        try:
+            if abs(int(left["age"]) - int(right["age"])) > 2:
+                return True
+        except ValueError:
+            pass
+    if left.get("role") and right.get("role") and _fold_phrase(left["role"]) != _fold_phrase(right["role"]):
+        return True
+    if left.get("email") and right.get("email") and left["email"].lower() != right["email"].lower():
+        return True
+    if left.get("ident") and right.get("ident") and left["ident"] != right["ident"]:
+        return True
+    if left.get("department") and right.get("department") and _fold_phrase(left["department"]) != _fold_phrase(right["department"]):
+        return True
+    return False
 
 
 def _preview_text(path: Path) -> str:
@@ -172,15 +260,20 @@ class IngestionPipeline:
         lang: str = "en",
         department: str = "public",
         role: str = "admin",
+        engine: str = "local",
+        resolution: str = "",
     ) -> Dict[str, Any]:
         filename = filename or source_path.name
         modality, file_type = classify_path(Path(filename))
         digest = sha256_file(source_path)
         preview = _preview_text(source_path)
-        target = self._version_target(department or "public", filename, preview)
-        if target:
-            if target.get("sha256") == digest and target.get("status") == "ready":
-                return target
+        choice = (resolution or "").strip().lower()
+        target = None if choice == "separate" else self._version_target(department or "public", filename, preview)
+        if target and target.get("sha256") == digest and target.get("status") == "ready":
+            if not copy and source_path.exists():
+                source_path.unlink()
+            return target
+        if target and choice == "update":
             return self._replace_version(
                 target,
                 source_path,
@@ -193,7 +286,10 @@ class IngestionPipeline:
                 lang=lang,
                 department=department or "public",
                 role=role,
+                engine=engine,
             )
+        if target:
+            raise NameCollision(self._conflict_payload(target, filename, preview))
         existing = self.store.find_by_sha(digest)
         if existing and existing.get("status") == "ready":
             duplicate = self.store.create_document(
@@ -246,6 +342,7 @@ class IngestionPipeline:
             message="Queued for multimodal ingestion",
             meta={
                 "lang": "tr" if str(lang).lower().startswith("tr") else "en",
+                "answer_engine": (engine or "local").strip().lower() or "local",
                 "department": department or "public",
                 "role": role,
                 "version": 1,
@@ -265,10 +362,19 @@ class IngestionPipeline:
         self.enqueue(doc_id)
         return document
 
+    def _document_names(self, document: Dict[str, Any]) -> set[str]:
+        text = _preview_text(Path(str(document.get("stored_path") or "")))
+        names = _names_in_text(text, str(document.get("filename") or ""))
+        for entity in (document.get("briefing") or {}).get("entities") or []:
+            folded = _fold_phrase(str(entity))
+            if len(folded.split()) >= 2:
+                names.add(folded)
+        return names
+
     def _version_target(self, department: str, filename: str, preview: str) -> Optional[Dict[str, Any]]:
-        """The document in this department that the new file should replace."""
-        key = person_key(preview)
-        person_match: Optional[Dict[str, Any]] = None
+        """An active document in this department with the same filename or entity name."""
+        incoming = _names_in_text(preview, filename)
+        name_match: Optional[Dict[str, Any]] = None
         for document in self.store.list_documents():
             if document.get("status") == "duplicate":
                 continue
@@ -277,10 +383,47 @@ class IngestionPipeline:
                 continue
             if document.get("filename") == filename:
                 return document
-            if key and person_key(_preview_text(Path(str(document.get("stored_path") or "")))) == key:
-                if person_match is None or float(document.get("updated_at") or 0) > float(person_match.get("updated_at") or 0):
-                    person_match = document
-        return person_match
+            if incoming and incoming & self._document_names(document):
+                if name_match is None or float(document.get("updated_at") or 0) > float(name_match.get("updated_at") or 0):
+                    name_match = document
+        return name_match
+
+    def _conflict_payload(self, existing: Dict[str, Any], filename: str, incoming_text: str) -> Dict[str, Any]:
+        current = _preview_text(Path(str(existing.get("stored_path") or "")))
+        if not current:
+            current = str((existing.get("meta") or {}).get("edited_text") or "")
+        left = _record_fields(current)
+        right = _record_fields(incoming_text)
+        fields = ("age", "role", "amount")
+        return {
+            "conflict_detected": True,
+            "namesake": _namesake(left, right),
+            "existing": {
+                "id": existing.get("id"),
+                "filename": existing.get("filename") or "",
+                "version": int((existing.get("meta") or {}).get("version") or 1),
+                "fields": {key: left.get(key) or "" for key in fields},
+                "text": current[:4000],
+            },
+            "incoming": {
+                "filename": filename,
+                "fields": {key: right.get(key) or "" for key in fields},
+                "text": (incoming_text or "")[:4000],
+            },
+        }
+
+    def _remember_version(self, document: Dict[str, Any]) -> None:
+        text = _preview_text(Path(str(document.get("stored_path") or "")))
+        if not text:
+            text = str((document.get("meta") or {}).get("edited_text") or "")
+        if not text.strip():
+            return
+        self.store.save_document_version(
+            doc_id=str(document.get("id") or ""),
+            version=int((document.get("meta") or {}).get("version") or 1),
+            filename=str(document.get("filename") or ""),
+            body=text,
+        )
 
     def _replace_version(
         self,
@@ -296,8 +439,10 @@ class IngestionPipeline:
         lang: str,
         department: str,
         role: str,
+        engine: str = "local",
     ) -> Dict[str, Any]:
         doc_id = str(existing["id"])
+        self._remember_version(existing)
         self.vectors.delete_document(doc_id)
         dest_dir = self.settings.uploads_dir / doc_id
         if dest_dir.exists():
@@ -314,6 +459,7 @@ class IngestionPipeline:
         meta.update(
             {
                 "lang": "tr" if str(lang).lower().startswith("tr") else "en",
+                "answer_engine": (engine or "local").strip().lower() or "local",
                 "department": department or "public",
                 "role": role,
                 "version": version,
@@ -653,12 +799,16 @@ class IngestionPipeline:
                 name = resident.get("name") or ""
                 if name and "embed" not in name.lower():
                     self.ollama.unload(name)
+            spoken = str((document.get("meta") or {}).get("lang") or "")
+            answer_engine = str((document.get("meta") or {}).get("answer_engine") or "local")
             extraction = self.whisper.transcribe(
                 path,
                 doc_id=doc_id,
                 filename=filename,
                 transcript_dir=self.settings.transcripts_dir,
                 progress=progress,
+                language="tr" if spoken.startswith("tr") else ("en" if spoken.startswith("en") else None),
+                allow_cloud=cloud_transcription_allowed(answer_engine),
             )
             chunks = extraction.chunks
             briefing_source = extraction.full_text
@@ -667,6 +817,7 @@ class IngestionPipeline:
                     "duration": extraction.duration,
                     "language": extraction.language,
                     "transcript_path": extraction.transcript_path,
+                    "transcript_engine": extraction.engine,
                 }
             )
         elif modality == "image":
@@ -793,6 +944,7 @@ class IngestionPipeline:
         path = Path(str(document.get("stored_path") or ""))
         if is_tabular_path(path):
             return document
+        self._remember_version(document)
         if path.suffix.lower() in {".md", ".txt", ".markdown"} and path.parent.exists():
             try:
                 path.write_text(text, encoding="utf-8")
@@ -1017,4 +1169,5 @@ class IngestionPipeline:
             copy=True,
             lang=str(detail.get("lang") or "en"),
             department=str(revision.get("department") or "public"),
+            resolution="separate",
         )
